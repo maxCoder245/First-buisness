@@ -1,63 +1,80 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import sqlite3
-from datetime import datetime, time
+import os
+import datetime
+from zoneinfo import ZoneInfo
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-app = FastAPI()
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+SERVICE_ACCOUNT_FILE = 'service_account.json'
 
-# Allow requests from your GitHub Pages domain
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Update this to your github.io URL in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configuration
+CALENDAR_ID = 'your_email@gmail.com' 
+TIMEZONE = 'Australia/Sydney' 
 
-class BookingRequest(BaseModel):
-    service: str
-    date: str
-    time: str
-    address: str
-    cost: int
+def get_calendar_service():
+    """Authenticates and returns the Calendar API service."""
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        return None
+    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    return build('calendar', 'v3', credentials=creds)
 
-def init_db():
-    # Simple analytics/tracking for bookings
-    conn = sqlite3.connect('bookings.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS bookings
-                 (id INTEGER PRIMARY KEY, service TEXT, date TEXT, time TEXT, address TEXT, cost INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    conn.close()
+def check_availability(service, target_date, target_time, duration_minutes=30):
+    """
+    Uses the FreeBusy API to check if the target time slot is open.
+    target_date format: 'YYYY-MM-DD'
+    target_time format: 'HH:MM'
+    """
+    # Create timezone-aware datetime objects
+    start_dt = datetime.datetime.strptime(f"{target_date} {target_time}", "%Y-%m-%d %H:%M")
+    start_dt = start_dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
 
-init_db()
-
-@app.post("/api/book")
-async def create_booking(booking: BookingRequest):
-    # 1. Enforce strict timing on the backend (never trust the frontend alone)
-    req_time = datetime.strptime(booking.time, '%H:%M').time()
-    start_bound = time(15, 50)
-    end_bound = time(17, 0)
+    body = {
+        "timeMin": start_dt.isoformat(),
+        "timeMax": end_dt.isoformat(),
+        "timeZone": TIMEZONE,
+        "items": [{"id": CALENDAR_ID}]
+    }
     
-    if not (start_bound <= req_time <= end_bound):
-        raise HTTPException(status_code=400, detail="Bookings only allowed between 3:50 PM and 5:00 PM.")
+    try:
+        events_result = service.freebusy().query(body=body).execute()
+        calendars = events_result.get('calendars', {})
+        busy_slots = calendars.get(CALENDAR_ID, {}).get('busy', [])
+        
+        # If the busy array is empty, the slot is available
+        return len(busy_slots) == 0
+    except HttpError as error:
+        print(f"Error checking calendar: {error}")
+        return False
 
-    # 2. Check Google Calendar API for conflicts here
-    # (Pseudocode) is_busy = check_gcal_availability(booking.date, booking.time)
-    # if is_busy: raise HTTPException(status_code=409, detail="Time slot taken")
-
-    # 3. Log to database for your analytics
-    conn = sqlite3.connect('bookings.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO bookings (service, date, time, address, cost) VALUES (?, ?, ?, ?, ?)",
-              (booking.service, booking.date, booking.time, booking.address, booking.cost))
-    conn.commit()
-    conn.close()
-
-    # 4. Write event to Google Calendar to block future bookings
-    # create_gcal_event(...)
-
-    return {"status": "success", "message": "Booking confirmed!"}
-
-# Run locally with: uvicorn main:app --reload
+def create_booking_event(service, target_date, target_time, duration_minutes, booking_details):
+    """
+    Creates a new calendar event for the confirmed booking.
+    """
+    start_dt = datetime.datetime.strptime(f"{target_date} {target_time}", "%Y-%m-%d %H:%M")
+    start_dt = start_dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+    
+    event = {
+        'summary': f"Service Booking: {booking_details['service']}",
+        'location': booking_details['address'],
+        'description': f"Service: {booking_details['service']}\nExpected Revenue: ${booking_details['cost']}",
+        'start': {
+            'dateTime': start_dt.isoformat(),
+            'timeZone': TIMEZONE,
+        },
+        'end': {
+            'dateTime': end_dt.isoformat(),
+            'timeZone': TIMEZONE,
+        },
+        # Color coding makes it easy to spot on your personal calendar (e.g., 9 = Blueberry/Blue)
+        'colorId': '9' 
+    }
+    
+    try:
+        created_event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+        return created_event.get('htmlLink')
+    except HttpError as error:
+        print(f"Error creating event: {error}")
+        return None
